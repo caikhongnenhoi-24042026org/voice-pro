@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
-Web Crawler Tool - Crawl any website, save HTML pages, download linked files,
+crawl-web - Crawl any website, save HTML pages, download linked files,
 and zip the results for easy sharing.
 
-Commands:
-    crawl    - Recursively crawl a website and save HTML pages
-    download - Parse crawled HTML files, find download links, and download files
-               with titles as filenames
-    all      - Crawl + download + zip in one command
+Install:
+    pip install crawl-web
 
 Usage:
-    python crawl_web.py crawl <url> [options]
-    python crawl_web.py download <html_dir> [options]
-    python crawl_web.py all <url> [options]
+    crawl-web crawl <url> [options]
+    crawl-web download <html_dir> [options]
+    crawl-web all <url> [options]
 
 Examples:
-    # Crawl any website
-    python crawl_web.py crawl https://example.com/ -o ./crawled
-
-    # Download files from crawled pages (named by page title)
-    python crawl_web.py download ./crawled -o ./downloads
-
-    # All-in-one: crawl + download + zip
-    python crawl_web.py all https://example.com/ -o ./output
-    python crawl_web.py all https://asianresearchcenter.org/ -o ./output --max-pages 100
+    crawl-web crawl https://example.com/ -o ./crawled
+    crawl-web download ./crawled -o ./downloads --zip
+    crawl-web all https://example.com/ -o ./output --max-pages 100
 """
+
+__version__ = "1.0.0"
 
 import argparse
 import hashlib
