@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Web Crawler Tool - Crawl websites, save HTML pages, and download linked files.
+Web Crawler Tool - Crawl any website, save HTML pages, download linked files,
+and zip the results for easy sharing.
 
 Commands:
-    crawl   - Recursively crawl a website and save HTML pages
+    crawl    - Recursively crawl a website and save HTML pages
     download - Parse crawled HTML files, find download links, and download files
                with titles as filenames
+    all      - Crawl + download + zip in one command
 
 Usage:
     python crawl_web.py crawl <url> [options]
     python crawl_web.py download <html_dir> [options]
+    python crawl_web.py all <url> [options]
 
 Examples:
-    # Step 1: Crawl website
-    python crawl_web.py crawl https://asianresearchcenter.org/ -o ./crawled
+    # Crawl any website
+    python crawl_web.py crawl https://example.com/ -o ./crawled
 
-    # Step 2: Download files from crawled pages (named by page title)
+    # Download files from crawled pages (named by page title)
     python crawl_web.py download ./crawled -o ./downloads
 
-    # One-shot: crawl + download in one command
-    python crawl_web.py crawl https://asianresearchcenter.org/ -o ./crawled --download ./downloads
+    # All-in-one: crawl + download + zip
+    python crawl_web.py all https://example.com/ -o ./output
+    python crawl_web.py all https://asianresearchcenter.org/ -o ./output --max-pages 100
 """
 
 import argparse
@@ -27,6 +31,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 from collections import deque
@@ -61,6 +66,10 @@ DOWNLOAD_EXTENSIONS = {
     ".epub", ".mobi",
 }
 
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 
 def normalize_url(url):
     """Normalize a URL by removing fragments and trailing slashes."""
@@ -99,14 +108,49 @@ def url_to_filepath(url, output_dir):
 
 def sanitize_filename(name):
     """Sanitize a string for use as a filename."""
-    # Replace problematic characters with underscore
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
-    # Replace multiple spaces/underscores with single
     name = re.sub(r"[_\s]+", " ", name).strip()
-    # Limit length
     if len(name) > 200:
         name = name[:200]
     return name
+
+
+def clean_title(raw_title, site_name=None):
+    """Clean page title by removing common site name suffixes.
+
+    Handles patterns like:
+        "Article Title | Site Name"
+        "Article Title - Site Name"
+        "Article Title — Site Name"
+    """
+    if not raw_title:
+        return raw_title
+
+    # Common separator patterns between title and site name
+    separators = [" | ", " - ", " — ", " – ", " :: "]
+
+    for sep in separators:
+        if sep in raw_title:
+            parts = raw_title.split(sep)
+            # The site name is usually the last part
+            if len(parts) >= 2:
+                candidate = parts[-1].strip()
+                # If a site_name is given, check if it matches
+                if site_name and site_name.lower() in candidate.lower():
+                    return sep.join(parts[:-1]).strip()
+                # Otherwise, if the last part is short (likely a site name),
+                # remove it only if we have a site_name hint
+                if site_name:
+                    return sep.join(parts[:-1]).strip()
+
+    # If site_name provided, try removing it directly
+    if site_name:
+        # Remove trailing site name patterns
+        for sep in separators:
+            pattern = re.escape(sep) + re.escape(site_name)
+            raw_title = re.sub(pattern + r"\s*$", "", raw_title, flags=re.IGNORECASE)
+
+    return raw_title.strip()
 
 
 def extract_links(html_content, base_url):
@@ -161,15 +205,24 @@ def extract_title(html_content):
     """Extract the page title from HTML content."""
     soup = BeautifulSoup(html_content, "lxml")
 
-    # Try <h1> first (usually more specific)
     h1 = soup.find("h1")
     if h1 and h1.text.strip():
         return h1.text.strip()
 
-    # Fall back to <title> tag
     title = soup.find("title")
     if title and title.text.strip():
         return title.text.strip()
+
+    return None
+
+
+def extract_site_name(html_content):
+    """Try to extract the site name from HTML meta tags."""
+    soup = BeautifulSoup(html_content, "lxml")
+
+    og_site = soup.find("meta", property="og:site_name")
+    if og_site and og_site.get("content"):
+        return og_site["content"].strip()
 
     return None
 
@@ -211,6 +264,37 @@ def should_skip_url(url):
     parsed = urlparse(url)
     path_lower = parsed.path.lower()
     return any(path_lower.endswith(ext) for ext in skip_extensions)
+
+
+def create_zip(source_dir, zip_name=None):
+    """Create a zip archive from a directory.
+
+    Args:
+        source_dir: Directory to zip.
+        zip_name: Output zip filename (without .zip extension).
+                  Defaults to the directory name.
+
+    Returns:
+        Path to the created zip file.
+    """
+    if not os.path.exists(source_dir) or not os.listdir(source_dir):
+        logger.warning("Directory is empty or does not exist: %s", source_dir)
+        return None
+
+    if not zip_name:
+        zip_name = os.path.basename(os.path.normpath(source_dir))
+
+    # Place zip file next to the source directory
+    parent_dir = os.path.dirname(os.path.abspath(source_dir))
+    zip_base = os.path.join(parent_dir, zip_name)
+
+    logger.info("Creating zip archive: %s.zip", zip_base)
+    zip_path = shutil.make_archive(zip_base, "zip", source_dir)
+
+    zip_size = os.path.getsize(zip_path)
+    logger.info("Zip created: %s (%.1f MB)", zip_path, zip_size / (1024 * 1024))
+
+    return zip_path
 
 
 # ---------------------------------------------------------------------------
@@ -351,14 +435,25 @@ def download_from_crawled(html_dir, download_dir, wait_time=0.5, timeout=60):
     error_count = 0
     seen_urls = set()
 
+    # Try to detect site name from the first HTML file for title cleaning
+    site_name = None
+    for html_file in html_files:
+        with open(html_file, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        site_name = extract_site_name(content)
+        if site_name:
+            logger.info("Detected site name: %s", site_name)
+            break
+
     for html_file in sorted(html_files):
-        with open(html_file, "r", encoding="utf-8") as f:
+        with open(html_file, "r", encoding="utf-8", errors="ignore") as f:
             html_content = f.read()
 
         title = extract_title(html_content)
-        download_links = extract_download_links(html_content, "https://placeholder.invalid/")
+        if title:
+            title = clean_title(title, site_name)
 
-        # Re-extract with proper base URL from the HTML file
+        # Extract base URL from the HTML file
         soup = BeautifulSoup(html_content, "lxml")
         canonical = soup.find("link", rel="canonical")
         base_url = canonical["href"] if canonical and canonical.get("href") else ""
@@ -366,8 +461,10 @@ def download_from_crawled(html_dir, download_dir, wait_time=0.5, timeout=60):
             og_url = soup.find("meta", property="og:url")
             base_url = og_url["content"] if og_url and og_url.get("content") else ""
 
-        if base_url:
-            download_links = extract_download_links(html_content, base_url)
+        if not base_url:
+            base_url = "https://placeholder.invalid/"
+
+        download_links = extract_download_links(html_content, base_url)
 
         if not download_links:
             continue
@@ -382,7 +479,6 @@ def download_from_crawled(html_dir, download_dir, wait_time=0.5, timeout=60):
             if title:
                 filename = sanitize_filename(title) + ext
             else:
-                # Fall back to URL-based name
                 filename = os.path.basename(urlparse(dl_url).path)
                 if not filename:
                     filename = hashlib.md5(dl_url.encode()).hexdigest()[:12] + ext
@@ -444,23 +540,46 @@ def download_from_crawled(html_dir, download_dir, wait_time=0.5, timeout=60):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Crawl websites and download linked files.",
+        description="Crawl any website, download linked files, and zip results.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Crawl a website (HTML only)
-  %(prog)s crawl https://asianresearchcenter.org/
-  %(prog)s crawl https://asianresearchcenter.org/ -o ./crawled -d 5
+  %(prog)s crawl https://example.com/
+  %(prog)s crawl https://example.com/ -o ./crawled -d 5 --max-pages 100
 
-  # Crawl and auto-download files
-  %(prog)s crawl https://asianresearchcenter.org/ -o ./crawled --download ./downloads
+  # Crawl and auto-download files, then zip
+  %(prog)s crawl https://example.com/ -o ./crawled --download ./downloads --zip
 
   # Download files from previously crawled HTML pages
-  %(prog)s download ./crawled -o ./downloads
+  %(prog)s download ./crawled -o ./downloads --zip
+
+  # All-in-one: crawl + download + zip
+  %(prog)s all https://example.com/ -o ./output
+  %(prog)s all https://asianresearchcenter.org/ -o ./output --max-pages 100
         """,
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # --- Common arguments ---
+    def add_common_args(p):
+        p.add_argument(
+            "-w", "--wait", type=float, default=0.5,
+            help="Wait time between requests in seconds (default: 0.5)",
+        )
+        p.add_argument(
+            "--timeout", type=int, default=30,
+            help="Request timeout in seconds (default: 30)",
+        )
+        p.add_argument(
+            "--zip", action="store_true",
+            help="Create a zip archive of the output",
+        )
+        p.add_argument(
+            "-v", "--verbose", action="store_true",
+            help="Enable verbose/debug logging",
+        )
 
     # --- crawl subcommand ---
     crawl_parser = subparsers.add_parser("crawl", help="Crawl a website and save HTML pages")
@@ -474,25 +593,14 @@ Examples:
         help="Maximum crawl depth, 0=unlimited (default: 10)",
     )
     crawl_parser.add_argument(
-        "-w", "--wait", type=float, default=0.5,
-        help="Wait time between requests in seconds (default: 0.5)",
-    )
-    crawl_parser.add_argument(
         "--max-pages", type=int, default=0,
         help="Maximum number of pages to save, 0=unlimited (default: 0)",
-    )
-    crawl_parser.add_argument(
-        "--timeout", type=int, default=30,
-        help="Request timeout in seconds (default: 30)",
     )
     crawl_parser.add_argument(
         "--download", metavar="DOWNLOAD_DIR", default=None,
         help="After crawling, also download files to this directory",
     )
-    crawl_parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Enable verbose/debug logging",
-    )
+    add_common_args(crawl_parser)
 
     # --- download subcommand ---
     dl_parser = subparsers.add_parser(
@@ -503,18 +611,26 @@ Examples:
         "-o", "--output", default="./downloads",
         help="Output directory for downloaded files (default: ./downloads)",
     )
-    dl_parser.add_argument(
-        "-w", "--wait", type=float, default=0.5,
-        help="Wait time between downloads in seconds (default: 0.5)",
+    add_common_args(dl_parser)
+
+    # --- all subcommand (crawl + download + zip) ---
+    all_parser = subparsers.add_parser(
+        "all", help="Crawl + download + zip in one command",
     )
-    dl_parser.add_argument(
-        "--timeout", type=int, default=60,
-        help="Download timeout in seconds (default: 60)",
+    all_parser.add_argument("url", help="The starting URL to crawl")
+    all_parser.add_argument(
+        "-o", "--output", default="./output",
+        help="Base output directory (default: ./output)",
     )
-    dl_parser.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Enable verbose/debug logging",
+    all_parser.add_argument(
+        "-d", "--max-depth", type=int, default=10,
+        help="Maximum crawl depth, 0=unlimited (default: 10)",
     )
+    all_parser.add_argument(
+        "--max-pages", type=int, default=0,
+        help="Maximum number of pages to save, 0=unlimited (default: 0)",
+    )
+    add_common_args(all_parser)
 
     args = parser.parse_args()
 
@@ -534,15 +650,23 @@ Examples:
             max_pages=args.max_pages,
             timeout=args.timeout,
         )
-        if args.download:
+
+        download_dir = args.download
+        if download_dir:
             logger.info("")
             logger.info("Starting download phase...")
             download_from_crawled(
                 html_dir=args.output,
-                download_dir=args.download,
+                download_dir=download_dir,
                 wait_time=args.wait,
                 timeout=args.timeout,
             )
+
+        if args.zip:
+            logger.info("")
+            create_zip(args.output, "crawled_pages")
+            if download_dir:
+                create_zip(download_dir, "downloads")
 
     elif args.command == "download":
         download_from_crawled(
@@ -551,6 +675,42 @@ Examples:
             wait_time=args.wait,
             timeout=args.timeout,
         )
+        if args.zip:
+            logger.info("")
+            create_zip(args.output, "downloads")
+
+    elif args.command == "all":
+        # Derive subdirectories from base output
+        domain = urlparse(args.url).netloc.replace(".", "_")
+        html_dir = os.path.join(args.output, f"{domain}_html")
+        download_dir = os.path.join(args.output, f"{domain}_downloads")
+
+        crawl(
+            start_url=args.url,
+            output_dir=html_dir,
+            max_depth=args.max_depth,
+            wait_time=args.wait,
+            max_pages=args.max_pages,
+            timeout=args.timeout,
+        )
+
+        logger.info("")
+        logger.info("Starting download phase...")
+        dl_count = download_from_crawled(
+            html_dir=html_dir,
+            download_dir=download_dir,
+            wait_time=args.wait,
+            timeout=args.timeout,
+        )
+
+        # Always zip in 'all' mode (unless --zip explicitly set to false via no flag)
+        logger.info("")
+        create_zip(html_dir, f"{domain}_html")
+        if dl_count > 0:
+            create_zip(download_dir, f"{domain}_downloads")
+
+        logger.info("")
+        logger.info("All done! Output directory: %s", args.output)
 
 
 if __name__ == "__main__":
